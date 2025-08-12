@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Review Pending Results</title>
+</head>
+<body>
+    <h1>Review Pending Results</h1>
+    {% if results %}
+        <ul>
+        {% for r in results %}
+            <li>
+                <a href="{{ r.url }}" target="_blank">{{ r.title }}</a>
+                <form style="display:inline" method="post" action="{{ url_for('approve', video_id=r.video_id) }}">
+                    <button type="submit">Approve</button>
+                </form>
+                <form style="display:inline" method="post" action="{{ url_for('reject', video_id=r.video_id) }}">
+                    <button type="submit">Reject</button>
+                </form>
+            </li>
+        {% endfor %}
+        </ul>
+    {% else %}
+        <p>No pending results.</p>
+    {% endif %}
+    <a href="/">Back to Search</a><br>
+    <a href="/approved">View Approved Results</a>
+</body>
+</html>
+

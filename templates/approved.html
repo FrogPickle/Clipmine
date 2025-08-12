@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Approved Results</title>
+</head>
+<body>
+    <h1>Approved Results</h1>
+
+    {% if results %}
+        <ul>
+        {% for r in results %}
+            <li>
+                <a href="https://www.youtube.com/watch?v={{ r['video_id'] }}" target="_blank">{{ r['title'] }}</a>
+            </li>
+        {% endfor %}
+        </ul>
+    {% else %}
+        <p>No approved results yet.</p>
+    {% endif %}
+
+    <a href="/">Back to Search</a><br>
+    <a href="/review">Review Pending Results</a><br><br>
+
+    <button onclick="transcribeAll()">Transcribe All</button>
+    <div id="transcribe-status"></div>
+
+    <script>
+      async function transcribeAll() {
+        const statusDiv = document.getElementById("transcribe-status");
+        statusDiv.textContent = "Transcribing, please wait...";
+
+        const response = await fetch("/transcribe-all", { method: "POST" });
+        const result = await response.json();
+
+        statusDiv.textContent = result.message;
+        if (result.success) {
+          window.location.reload();
+        }
+      }
+    </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Search Results for "{{ query }}"</title>
+</head>
+<body>
+    <h1>Search Results for "{{ query }}"</h1>
+    {% if results %}
+        <ul>
+        {% for r in results %}
+            <li><a href="{{ r.url }}" target="_blank">{{ r.title }}</a></li>
+        {% endfor %}
+        </ul>
+        <p>These results have been added to the pending list for review.</p>
+    {% else %}
+        <p>No new results found.</p>
+    {% endif %}
+    <a href="/">Back to Search</a><br>
+    <a href="/review">Review Pending Results</a><br>
+    <a href="/approved">View Approved Results</a>
+</body>
+</html>
