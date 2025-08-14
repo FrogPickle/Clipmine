@@ -2,13 +2,19 @@ from flask import Flask, request, redirect, url_for, jsonify, render_template
 from faster_whisper import WhisperModel
 from pytube import YouTube
 import requests
-import os
+import os, pathlib
 import json
 
 app = Flask(__name__)
 
+def load_api_key(path="apikey.txt"):
+    p = pathlib.Path(path)
+    if not p.exists():
+        raise RuntimeError("apikey.txt not found. Create it and add your key.")
+    return p.read_text(encoding="utf-8").strip()
+
 # Put your actual YouTube Data API v3 key here:
-YOUTUBE_API_KEY = 'AIzaSyCn7wI4IIU22GjIQIi2RgEScRpD17GlkVc'
+YOUTUBE_API_KEY = load_api_key()
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
