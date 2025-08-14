@@ -4,6 +4,7 @@ from pytube import YouTube
 import requests
 import os, pathlib
 import json
+from tscripter import run_from_approved
 
 app = Flask(__name__)
 
@@ -210,59 +211,13 @@ def transcripts():
     '''
     
 @app.route("/transcribe-all", methods=["POST"])
+@app.route("/transcribe-all", methods=["POST"])
 def transcribe_all():
     try:
-        with open("data/approved.json", "r") as f:
-            approved = json.load(f)
-
-        model = WhisperModel("small", compute_type="int8", device="cpu")  # Adjust if you use GPU
-
-        processed = []
-
-        for video in approved:
-            video_id = video["video_id"]
-            transcript_path = f"data/transcripts/{video_id}.json"
-            if os.path.exists(transcript_path):
-                print(f"✅ Transcript already exists for {video_id}, skipping.")
-                processed.append(video)
-                continue
-
-            print(f"🔽 Downloading and transcribing {video_id}...")
-
-            # Download audio
-            yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-            audio_stream = yt.streams.filter(only_audio=True).first()
-            audio_path = f"data/audio/{video_id}.mp4"
-            os.makedirs("data/audio", exist_ok=True)
-            audio_stream.download(filename=audio_path)
-
-            # Transcribe using Faster-Whisper
-            segments, _ = model.transcribe(audio_path, language="en")
-
-            # Save JSON transcript
-            transcript = []
-            for seg in segments:
-                transcript.append({
-                    "start": seg.start,
-                    "end": seg.end,
-                    "text": seg.text.strip()
-                })
-
-            os.makedirs("data/transcripts", exist_ok=True)
-            with open(transcript_path, "w", encoding="utf-8") as f:
-                json.dump(transcript, f, indent=2)
-
-            os.remove(audio_path)
-            processed.append(video)
-
-        # Remove processed from approved.json
-        new_approved = [v for v in approved if v not in processed]
-        with open("data/approved.json", "w") as f:
-            json.dump(new_approved, f, indent=2)
-
-        return jsonify(success=True, message="✅ Transcription complete.")
+        run_from_approved()  # runs your transcription script
+        return jsonify(success=True, message="Transcription complete!")
     except Exception as e:
-        return jsonify(success=False, message=f"❌ Error: {str(e)}")    
+        return jsonify(success=False, message=f"❌ Error: {e}"), 500   
 
 if __name__ == '__main__':
     app.run(debug=True)
