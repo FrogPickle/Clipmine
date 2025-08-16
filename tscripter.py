@@ -6,6 +6,7 @@
 
 import os, json, time, random
 from typing import List, Dict, Tuple, Any
+from datetime import datetime
 
 APPROVED_PATH = "data/approved.json"
 TRANSCRIPTS_DIR = "data/transcripts"
@@ -63,6 +64,41 @@ def _mark_seen(vid: str):
     if vid not in seen:
         seen.append(vid)
         _write_json_atomic(SEEN_PATH, seen)
+        
+MAX_RETRIES = 1
+
+def _timestamp():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _move_to_failed(video_id: str, reason: str = "unknown error"):
+    failed_path = "data/failed.json"
+    approved = _read_json(APPROVED_PATH, [])
+    failed   = _read_json(failed_path, [])
+
+    # find and remove from approved
+    entry = next((v for v in approved if (
+        v == video_id or
+        (isinstance(v, dict) and v.get("videoId") == video_id)
+        or (isinstance(v, dict) and v.get("id") == video_id)
+        or (isinstance(v, dict) and v.get("video_id") == video_id)
+    )), None)
+
+    if entry:
+        approved = _remove_id(approved, video_id)
+        _write_json_atomic(APPROVED_PATH, approved)
+    else:
+        entry = {"video_id": video_id, "title": "(unknown)"}
+
+    # append to failed with details
+    if isinstance(entry, str):
+        entry = {"video_id": entry}
+    failed.append({
+        **entry,
+        "failed_at": _timestamp(),
+        "reason": reason,
+        "retries": MAX_RETRIES,
+    })
+    _write_json_atomic(failed_path, failed)        
 
 # ---------- transcript fetch (force .fetch path) ----------
 def fetch_transcript(video_id: str):
@@ -192,8 +228,10 @@ def run_from_approved():
                 break
             except Exception as e:
                 print(f"[ERROR] {vid}: {e}")
-                if attempt >= 5:
+                if attempt >= MAX_RETRIES:
                     print(f"[GIVE UP] {vid} after {attempt} attempts")
+                    _move_to_failed(vid, reason=str(e))
+
                 else:
                     _backoff(attempt)
                     
