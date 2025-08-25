@@ -12,6 +12,58 @@ APPROVED_PATH = "data/approved.json"
 TRANSCRIPTS_DIR = "data/transcripts"
 SEARCH_INDEX_PATH = "data/search_index.json"
 SEEN_PATH = "data/seen_ids.json"
+import re
+
+_YT_ID_RE = re.compile(r'(?:(?<=v=)|(?<=/v/)|(?<=/embed/)|(?<=youtu\.be/))([A-Za-z0-9_-]{11})')
+
+def _extract_vid(s: str | None) -> str | None:
+    """Return canonical 11-char YouTube ID from an ID or a URL (watch, youtu.be, embed)."""
+    if not s:
+        return None
+    s = str(s).strip()
+    # exact 11-char ID
+    if re.fullmatch(r'[A-Za-z0-9_-]{11}', s):
+        return s
+    # try to pull from URL
+    m = _YT_ID_RE.search(s)
+    return m.group(1) if m else None
+
+def _vid_of(entry) -> str | None:
+    """Get the canonical video id from an approved.json entry (string or dict)."""
+    if isinstance(entry, str):
+        return _extract_vid(entry)
+    if isinstance(entry, dict):
+        # try common keys
+        for k in ("video_id","videoId","id","url","link"):
+            if k in entry:
+                v = _extract_vid(entry[k])
+                if v: return v
+    return None
+
+def _remove_id_all(entries: list, video_id: str) -> tuple[list, int]:
+    """Remove ALL entries (strings or dicts) that refer to video_id (after normalization)."""
+    target = _extract_vid(video_id)
+    if not target:
+        return entries, 0
+    kept, removed = [], 0
+    for e in entries:
+        vid = _vid_of(e)
+        if vid and vid == target:
+            removed += 1
+        else:
+            kept.append(e)
+    return kept, removed
+
+def _dedupe_by_id(entries: list) -> list:
+    seen, out = set(), []
+    for e in entries:
+        vid = _vid_of(e)
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        out.append(e)
+    return out
+
 
 # ---------- tiny fs helpers ----------
 def _read_json(path: str, default):
@@ -65,7 +117,6 @@ def _mark_seen(vid: str):
         seen.append(vid)
         _write_json_atomic(SEEN_PATH, seen)
         
-MAX_RETRIES = 1
 
 def _timestamp():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -75,30 +126,28 @@ def _move_to_failed(video_id: str, reason: str = "unknown error"):
     approved = _read_json(APPROVED_PATH, [])
     failed   = _read_json(failed_path, [])
 
-    # find and remove from approved
-    entry = next((v for v in approved if (
-        v == video_id or
-        (isinstance(v, dict) and v.get("videoId") == video_id)
-        or (isinstance(v, dict) and v.get("id") == video_id)
-        or (isinstance(v, dict) and v.get("video_id") == video_id)
-    )), None)
+    # find a sample (to carry title/thumbnail if present)
+    sample = next((e for e in approved if _vid_of(e) == _extract_vid(video_id)), None)
+    entry = {"video_id": _extract_vid(video_id) or video_id, "title": "(unknown)"}
+    if isinstance(sample, dict):
+        for k in ("title","thumbnail"):
+            if k in sample:
+                entry[k] = sample[k]
 
-    if entry:
-        approved = _remove_id(approved, video_id)
-        _write_json_atomic(APPROVED_PATH, approved)
-    else:
-        entry = {"video_id": video_id, "title": "(unknown)"}
+    # remove ALL occurrences of this id
+    approved, n_removed = _remove_id_all(approved, video_id)
+    approved = _dedupe_by_id(approved)
+    _write_json_atomic(APPROVED_PATH, approved)
+    print(f"[CLEANUP] removed {n_removed} occurrence(s) of {entry['video_id']} from approved.json")
 
-    # append to failed with details
-    if isinstance(entry, str):
-        entry = {"video_id": entry}
+    # append to failed (allow duplicates there if you want, or dedupe too)
     failed.append({
         **entry,
         "failed_at": _timestamp(),
         "reason": reason,
-        "retries": MAX_RETRIES,
     })
-    _write_json_atomic(failed_path, failed)        
+    _write_json_atomic(failed_path, failed)
+      
 
 # ---------- transcript fetch (force .fetch path) ----------
 def fetch_transcript(video_id: str):
@@ -190,15 +239,12 @@ def update_search_index(video_id: str, segments: List[Dict[str, Any]], meta: Dic
     _write_json_atomic(index_path, index)
 
 # ---------- pacing/backoff ----------
-REQS_PER_MIN = 5
+REQS_PER_MIN = 10
 BASE_DELAY = 60.0 / REQS_PER_MIN
 
 def _pace(a=0.1, b=0.6):
     time.sleep(BASE_DELAY + random.uniform(a, b))
 
-def _backoff(attempt: int):
-    delay = min(2 ** (attempt - 1), 20)
-    time.sleep(delay + random.uniform(0, 0.5))
 
 # ---------- main runner ----------
 def run_from_approved():
@@ -206,36 +252,43 @@ def run_from_approved():
     queue = _extract_ids(approved_obj)
     if not queue:
         print("No approved IDs to process.")
-        return
+        return {"processed": 0, "moved_to_failed": 0}
+
+    processed = 0
+    moved = 0
 
     print(f"Found {len(queue)} approved video(s).")
     for vid in list(queue):  # iterate snapshot
-        for attempt in range(1, 6):  # up to 5 tries per ID
-            try:
-                print(f"[PROCESS] {vid} (attempt {attempt})")
-                segments, meta = fetch_transcript(vid)
+        try:
+            print(f"[PROCESS] {vid}")
+            # pace each networked operation a bit to avoid bursts
+            _pace()
 
-                save_per_video_json(vid, segments, meta)
-                update_search_index(vid, segments, meta)
+            segments, meta = fetch_transcript(vid)
 
-                # Immediately drain queue entry (crash-safe) and mark seen
-                _mark_seen(vid)
-                approved_obj = _remove_id(approved_obj, vid)
-                _write_json_atomic(APPROVED_PATH, approved_obj)
+            save_per_video_json(vid, segments, meta)
+            update_search_index(vid, segments, meta)
 
-                print(f"[DONE] {vid} — {len(segments)} segments")
-                _pace()
-                break
-            except Exception as e:
-                print(f"[ERROR] {vid}: {e}")
-                if attempt >= MAX_RETRIES:
-                    print(f"[GIVE UP] {vid} after {attempt} attempts")
-                    _move_to_failed(vid, reason=str(e))
+            # drain from approved and mark seen
+            _mark_seen(vid)
+            approved_obj, _ = _remove_id_all(approved_obj, vid)
+            approved_obj = _dedupe_by_id(approved_obj)
+            _write_json_atomic(APPROVED_PATH, approved_obj)
 
-                else:
-                    _backoff(attempt)
-                    
+            print(f"[DONE] {vid} — {len(segments)} segments")
+            processed += 1
 
+        except Exception as e:
+            print(f"[FAIL] {vid}: {e}")
+            _move_to_failed(vid, reason=str(e))
+            approved_obj, _ = _remove_id_all(approved_obj, vid)
+            approved_obj = _dedupe_by_id(approved_obj)
+            _write_json_atomic(APPROVED_PATH, approved_obj)   # optional but safest
+            moved += 1
+
+    print(f"[SUMMARY] processed={processed}, moved_to_failed={moved}")
+    return {"processed": processed, "moved_to_failed": moved}
+                
 
 
 if __name__ == "__main__":

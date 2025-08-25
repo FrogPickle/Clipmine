@@ -124,6 +124,54 @@ def _load_one_json(path: Path):
 
     # Unknown format — ignore gracefully
     return []
+    
+# --- FAST transcript index (concat text for quick searching) ---
+from bisect import bisect_right  # safe to import even if already present
+
+FAST = {}  # vid -> {"title", "segs", "text", "text_lc", "offsets"}
+
+def build_fast_index(force: bool = False):
+    """Concatenate each transcript into a single string + char offsets per segment."""
+    global FAST
+    if FAST and not force:
+        return
+    FAST = {}
+    if not TRANSCRIPTS_DIR.exists():
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for p in TRANSCRIPTS_DIR.glob("*.json"):
+        try:
+            segs = _load_one_json(p)
+            if not segs:
+                continue
+
+            parts, offsets, acc = [], [], 0
+            for s in segs:
+                offsets.append(acc)
+                t = s.get("text", "")
+                parts.append(t)
+                acc += len(t) + 1  # +1 for the space we join with
+
+            text = " ".join(parts)
+            title = None
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    title = raw.get("title") or raw.get("video_title")
+            except Exception:
+                pass
+
+            FAST[p.stem] = {
+                "title": title,
+                "segs": segs,
+                "text": text,
+                "text_lc": text.lower(),
+                "offsets": offsets,
+            }
+        except Exception:
+            continue
+    
 
 def build_index(force=False):
     """Scan data/transcripts and build in-memory index."""
@@ -172,6 +220,10 @@ def build_index(force=False):
 @app.before_request
 def _ensure_index():
     build_index(force=False)
+    
+@app.before_request
+def _ensure_fast_index():
+    build_fast_index(force=False)    
 
 def _yt_link(video_id: str, start: float) -> str:
     return f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s"
@@ -612,6 +664,21 @@ def _build_regex(raw: str):
         # whole-word by default; quoted = exact (but we normalized WS, so spaces are fine)
         return core if quoted else rf"(?<!\w){core}(?!\w)"
     return re.compile("|".join(f"(?:{pat(t)})" for t in parts), re.IGNORECASE)
+    
+def _match_to_segment_start(meta, pos_char: int):
+    offs = meta["offsets"]
+    idx = bisect_right(offs, pos_char) - 1
+    if idx < 0:
+        idx = 0
+    segs = meta["segs"]
+    if idx >= len(segs):
+        idx = len(segs) - 1
+    return float(segs[idx].get("start", 0.0)), idx
+
+# Reuse your existing snippet builder for consistent display
+def _display_snippet_from_text(text: str, m, pre_words=12, post_words=12):
+    return _display_snippet(text, m, pre_words=pre_words, post_words=post_words)    
+
 
 @app.get("/api/tsearch")
 def api_tsearch():
@@ -620,62 +687,61 @@ def api_tsearch():
     if not raw:
         return jsonify(groups=[], count=0)
 
-    rx = _build_regex(raw)  # your existing word-boundary/quotes builder
+    rx = _build_regex(raw)  # your existing builder (word-boundary + quoted)
 
-    groups = {}  # anchor_key -> {"text": display_snippet, "hits": [...], "_seen_vids": set()}
-    # iterate each transcript file
-    for p in TRANSCRIPTS_DIR.glob("*.json"):
-        segs = _load_segments(p)
-        i = 0
-        while i < len(segs):
-            # small window to avoid overlap noise; slightly bigger so display snippet has material
-            ctx, win_start, L, R = _stitch_window(segs, i, before=2, after=2, max_chars=360, max_gap=3.0)
-            hay = _normalize_ws(ctx)
+    groups = {}  # anchor -> {"text": display_snip, "hits":[{video_id,start,url}], "_seen_vids": set()}
 
-            added = False
-            for m in rx.finditer(hay):
-                # stable dedupe key based on ±5 words around the match
-                key = _anchor_key(hay, m, pre_words=5, post_words=5)
+    for vid, meta in FAST.items():
+        text = meta["text"]
+        hay  = meta["text_lc"]  # lowercased for matching
+        added_here = set()
+        for m in rx.finditer(hay):
+            # Build a stable anchor on the ORIGINAL text (same span)
+            # Note: rebuild a match object over original case by slicing indices
+            class _Span:  # tiny shim to pass .start()/.end() to anchor/snippet helpers
+                def __init__(self, a, b): self._a, self._b = a, b
+                def start(self): return self._a
+                def end(self): return self._b
 
-                g = groups.get(key)
-                disp = _display_snippet(hay, m, pre_words=12, post_words=12)
+            mm = _Span(m.start(), m.end())
 
-                if g is None:
-                    g = {"text": disp, "hits": [], "_seen_vids": set()}
-                    groups[key] = g
-                else:
-                    # if we ever see a longer/better snippet, keep that for display
-                    if len(disp) > len(g["text"]):
-                        g["text"] = disp
+            # Anchor (±5 words around the hit)
+            key = _anchor_key(text, mm, pre_words=5, post_words=5)
+            g = groups.get(key)
+            disp = _display_snippet_from_text(text, mm, pre_words=12, post_words=12)
 
-                # avoid multiple entries for the same video for this exact quote
-                if p.stem not in g["_seen_vids"]:
-                    g["_seen_vids"].add(p.stem)
-                    # start link exactly at the segment where this window began
-                    start_sec = int(segs[L]["start"])
-                    g["hits"].append({
-                        "video_id": p.stem,
-                        "start": start_sec,
-                        "url": _yt_link(p.stem, start_sec),
-                    })
+            if g is None:
+                g = {"text": disp, "hits": [], "_seen_vids": set()}
+                groups[key] = g
+            else:
+                if len(disp) > len(g["text"]):
+                    g["text"] = disp
 
-                added = True
-                break  # one match per window is enough
+            if vid not in g["_seen_vids"]:
+                # Map char pos to segment start
+                start_sec, _ = _match_to_segment_start(meta, m.start())
+                g["_seen_vids"].add(vid)
+                g["hits"].append({
+                    "video_id": vid,
+                    "start": int(start_sec),
+                    "url": _yt_link(vid, int(start_sec)),
+                })
 
-            # skip past this stitched window if we accepted it; otherwise advance by one segment
-            i = R + 1 if added else (i + 1)
+            # Avoid piling on tons of matches from same video for same anchor
+            if len(g["hits"]) >= per:
+                added_here.add(key)
 
-    # shape and sort output
+        # (Optional) Early stop if this video produced enough anchors already
+
     out = []
     for _, g in groups.items():
         hits = g["hits"][:per] if per > 0 else g["hits"]
         out.append({"quote": g["text"], "occurrences": hits})
+
+    # Order: show groups with most sources first
     out.sort(key=lambda x: (-len(x["occurrences"]), x["occurrences"][0]["start"] if x["occurrences"] else 0))
 
     return jsonify(groups=out, count=len(out))
-
-
-
 
 @app.get("/tsearch")
 def tsearch_page():
